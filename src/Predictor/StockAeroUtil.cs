@@ -24,6 +24,7 @@
 
 //#define PRECOMPUTE_CACHE
 using System;
+using System.Reflection;
 using UnityEngine;
 
 namespace Trajectories
@@ -272,10 +273,8 @@ namespace Trajectories
                 for (int j = 0; j < p.Modules.Count; ++j)
                 {
                     var m = p.Modules[j];
-                    float mcs_mod;
                     if (m is ModuleLiftingSurface)
                     {
-                        mcs_mod = 1.0f;
                         double liftQ = dyn_pressure * 1000;
                         ModuleLiftingSurface wing = (ModuleLiftingSurface)m;
                         Vector3 nVel = Vector3.zero;
@@ -284,10 +283,40 @@ namespace Trajectories
                         float absdot;
                         wing.SetupCoefficients(v_wrld_vel, out nVel, out liftVector, out liftdot, out absdot);
 
+                        // As ModuleControlSurface.FixedUpdate does: the fixed part of a control surface
+                        // (1 - ctrlSurfaceArea) sees the airflow as the surface does, its moving part
+                        // (ctrlSurfaceArea) sees it rotated by the deflection. Only the deployed deflection
+                        // (airbrakes, flaps) is kept: the pilot's inputs of the moment don't last.
+                        ModuleControlSurface ctrl = m as ModuleControlSurface;
+                        float ctrlArea = ctrl != null ? ctrl.ctrlSurfaceArea : 0f;
+                        Vector3 ctrlLiftVector = liftVector;
+                        float ctrlLiftDot = liftdot;
+                        float ctrlAbsDot = absdot;
+                        if (ctrl != null)
+                        {
+                            float deflection = DeployedDeflection(ctrl);
+                            Transform baseTransform = BaseTransform(wing);
+                            if (deflection != 0f && baseTransform != null)
+                            {
+                                ctrlLiftVector = Quaternion.AngleAxis(deflection, baseTransform.rotation * Vector3.right) * liftVector;
+                                ctrlLiftDot = Vector3.Dot(nVel, ctrlLiftVector);
+                                ctrlAbsDot = Mathf.Abs(ctrlLiftDot);
+                            }
+                        }
+
                         double prevMach = p.machNumber;
                         p.machNumber = mach;
-                        Vector3 local_lift = mcs_mod * wing.GetLiftVector(liftVector, liftdot, absdot, liftQ, (float)mach);
-                        Vector3 local_drag = mcs_mod * wing.GetDragVector(nVel, absdot, liftQ);
+                        Vector3 local_lift = (1f - ctrlArea) * wing.GetLiftVector(liftVector, liftdot, absdot, liftQ, (float)mach);
+                        Vector3 local_drag = Vector3.zero;
+                        // the game applies no drag of its own to a lifting surface without the internal drag model
+                        if (wing.useInternalDragModel)
+                            local_drag = (1f - ctrlArea) * wing.GetDragVector(nVel, absdot, liftQ);
+                        if (ctrl != null)
+                        {
+                            local_lift += ctrlArea * wing.GetLiftVector(ctrlLiftVector, ctrlLiftDot, ctrlAbsDot, liftQ, (float)mach);
+                            if (wing.useInternalDragModel)
+                                local_drag += ctrlArea * wing.GetDragVector(nVel, ctrlAbsDot, liftQ);
+                        }
                         p.machNumber = prevMach;
 
                         total_lift += local_lift;
@@ -312,6 +341,50 @@ namespace Trajectories
             Profiler.Stop("SimAeroForce");
             return force;
         }
+
+        private static readonly FieldInfo baseTransformField =
+            typeof(ModuleLiftingSurface).GetField("baseTransform", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        ///<summary> The transform the game computes the lift and drag of a lifting surface with (protected in the game), null if unavailable </summary>
+        private static Transform BaseTransform(ModuleLiftingSurface wing) => baseTransformField?.GetValue(wing) as Transform;
+
+        ///<summary> The deflection, in degrees, the game gives a control surface for its deployment alone (airbrakes, flaps),
+        /// without the pilot's inputs; 0 when it is not deployed </summary>
+        internal static float DeployedDeflection(ModuleControlSurface ctrl)
+        {
+            if (!ctrl.deploy)
+                return 0f;
+            // ModuleAeroSurface.CtrlSurfaceUpdate: the deployed airbrake turns by aeroDeployAngle
+            if (ctrl is ModuleAeroSurface aero)
+                return float.IsNaN(aero.aeroDeployAngle) ? 0f : (aero.deployInvert ? -1f : 1f) * aero.aeroDeployAngle;
+            // rotor blades (displaced velocity) are left out, as they were
+            if (ctrl.displaceVelocity || float.IsNaN(ctrl.deployAngle))
+                return 0f;
+            // ModuleControlSurface.FixedCtrlSurfaceUpdate: the deployed flap turns by deployAngle, on a side given
+            // by the mirror symmetry set in the editor, or else by the side of the vessel the surface sits on
+            float side = ctrl.deployInvert ? -1f : 1f;
+            if (ctrl.usesMirrorDeploy)
+            {
+                side *= (ctrl.partDeployInvert ? -1f : 1f) * (ctrl.mirrorDeploy ? -1f : 1f);
+            }
+            else
+            {
+                Transform baseTransform = BaseTransform(ctrl);
+                if (ctrl.vessel == null || baseTransform == null)
+                    return 0f;
+                side *= Mathf.Sign((Quaternion.Inverse(ctrl.vessel.ReferenceTransform.rotation) * (baseTransform.position - ctrl.vessel.CurrentCoM)).x);
+            }
+            float range = 1.5f * Mathf.Abs(ctrl.ctrlSurfaceRange);
+            return Mathf.Clamp(-side * ctrl.deployAngle, -range, range) * DeflectionDirection(ctrl);
+        }
+
+        private static readonly FieldInfo deflectionDirectionField =
+            typeof(ModuleControlSurface).GetField("deflectionDirection", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        ///<summary> -1 when the part variant of a control surface reverses its deployment, else 1
+        /// (protected in the game, absent from KSP 1.8: 1 then) </summary>
+        private static float DeflectionDirection(ModuleControlSurface ctrl) =>
+            deflectionDirectionField?.GetValue(ctrl) is float direction ? direction : 1f;
     } //StockAeroUtil
 }
 

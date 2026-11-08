@@ -40,6 +40,9 @@ namespace Trajectories
         private double referenceDrag = 0;
         private int referencePartCount = 0;
         private DateTime nextAllowedAutomaticUpdate = DateTime.Now;
+        private int referenceSignature = 0;
+        // while the vessel keeps changing (gear or flaps moving), the model is rebuilt once a second at most
+        private DateTime nextAllowedSignatureUpdate = DateTime.Now.AddSeconds(1);
 
         public bool UseCache => Settings.UseCache;
         protected AeroForceCache cachedForces;
@@ -54,6 +57,7 @@ namespace Trajectories
             body_ = body;
 
             referencePartCount = Trajectories.AttachedVessel.Parts.Count;
+            referenceSignature = ComputeAeroSignature();
 
             UpdateVesselMass();
 
@@ -116,9 +120,50 @@ namespace Trajectories
 #endif
                     isValid = false;
                 }
+                else if (DateTime.Now > nextAllowedSignatureUpdate && ComputeAeroSignature() != referenceSignature)
+                {
+#if DEBUG
+                    ScreenMessages.PostScreenMessage("Trajectory aerodynamic model auto-updated (vessel configuration changed)");
+#endif
+                    isValid = false;
+                }
             }
 
             return isValid;
+        }
+
+        ///<summary> A hash of what changes the aerodynamics of the attached vessel without changing its part count:
+        /// the parts shielded from the airstream, the weights of the drag cubes (gear, cargo bays, solar panels...)
+        /// and the deployed deflection of the control surfaces (airbrakes, flaps) </summary>
+        private static int ComputeAeroSignature()
+        {
+            Profiler.Start("AeroModel.ComputeAeroSignature");
+            int hash = 17;
+            unchecked
+            {
+                foreach (Part part in Trajectories.AttachedVessel.Parts)
+                {
+                    hash = hash * 31 + (part.ShieldedFromAirstream ? 1 : 0);
+                    bool controlSurface = false;
+                    for (int i = 0; i < part.Modules.Count; ++i)
+                    {
+                        if (part.Modules[i] is ModuleControlSurface ctrl)
+                        {
+                            controlSurface = true;
+                            hash = hash * 31 + Mathf.RoundToInt(StockAeroUtil.DeployedDeflection(ctrl));
+                        }
+                    }
+                    // a control surface weighs its drag cubes by its current deflection, pilot's inputs included:
+                    // left out, they would rebuild the model at every move of the stick
+                    if (!controlSurface && part.DragCubes != null && !part.DragCubes.None)
+                    {
+                        foreach (DragCube cube in part.DragCubes.Cubes)
+                            hash = hash * 31 + Mathf.RoundToInt(cube.Weight * 100f);
+                    }
+                }
+            }
+            Profiler.Stop("AeroModel.ComputeAeroSignature");
+            return hash;
         }
 
         public void Invalidate() => isValid = false;
